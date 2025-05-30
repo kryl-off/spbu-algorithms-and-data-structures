@@ -514,7 +514,7 @@ class MainWindow(QMainWindow):
         self.sa_manual_path_lineedit.setPlaceholderText("Введите номера вершин через запятую, например: 0,2,1")
 
         self.sa_manual_path_lineedit.setEnabled(False)
-        sa_layout.addWidget(QLabel("Вручной ввод начального пути"))
+        sa_layout.addWidget(QLabel("Ручной ввод начального пути"))
         sa_layout.addWidget(self.sa_manual_path_lineedit)
 
         self.sa_algorithm = QComboBox()

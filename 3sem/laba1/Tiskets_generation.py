@@ -9,7 +9,7 @@ import utils
 fake = faker.Faker('ru.RU')
 
 initial_time = datetime(2024, 10, 1, 0, 0)
-end_time = initial_time + relativedelta(days=3)
+end_time = initial_time + relativedelta(days=1)
 
 train_dictionary_df = pd.read_excel('../data/trainsbook.xlsx')
 
