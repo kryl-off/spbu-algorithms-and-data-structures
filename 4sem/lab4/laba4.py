@@ -1,349 +1,308 @@
-import sys
-import pandas as pd
+"""
+FOREL Clustering Laboratory GUI — версия 8
+Новое:
+  • Чекбокс «Кодировать категориальные» (по-умолчанию ✓).
+  • При загрузке CSV:
+       ─ числовые столбцы остаются как есть;
+       ─ категориальные → pd.get_dummies(drop_first=True, dtype=float);
+       ─ конкатенация => полностью числовой датасет.
+  • В логе выводится, сколько dummy-столбцов создано.
+Остальной функционал v7 (генерация, выбор признаков, FOREL, оценка) без изменений.
+"""
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 import numpy as np
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QTableView, QFileDialog, QMessageBox,
-    QCheckBox, QSpinBox, QGroupBox, QFormLayout, QScrollArea, QTextEdit, QComboBox)
-from PyQt5.QtCore import QAbstractTableModel, Qt
-import datetime
+import pandas as pd
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+
+PREVIEW_ROWS = 300
 
 
-def introduce_missing_values(df, column, percent, min_group_size=2, max_group_size=10):
-    """
-    Вставляет пропуски в столбец column пачками случайной длины (от 2 до 10 подряд).
-    
-    Parameters:
-        df (pd.DataFrame): исходный датафрейм
-        column (str): имя столбца, в который вносятся пропуски
-        percent (float): доля пропусков от общего числа строк
-        min_group_size (int): минимальный размер группы пропусков
-        max_group_size (int): максимальный размер группы пропусков
-    
-    Returns:
-        pd.DataFrame: копия датафрейма с пропусками
-        list: индексы всех строк с пропусками
-    """
-    df_copy = df.copy()
-    total_missing = int(len(df) * percent / 100)
-    indices_with_nans = set()
-    used_indices = set()
-    
-    while len(indices_with_nans) < total_missing:
-        group_size = np.random.randint(min_group_size, max_group_size + 1)
-        start = np.random.randint(0, len(df) - group_size + 1)
-        group = set(range(start, start + group_size))
-        
-        if used_indices.intersection(group):
-            continue  # избежать перекрытия
-        
-        used_indices.update(group)
-        indices_with_nans.update(group)
-
-    # ограничиваем количество пропусков до нужного total_missing
-    indices_with_nans = list(indices_with_nans)[:total_missing]
-    df_copy.loc[indices_with_nans, column] = np.nan
-    return df_copy, indices_with_nans
-
-def impute_by_group(df, target_col, group_col):
-    overall_median = df[target_col].median()
-    df[target_col] = df.groupby(group_col)[target_col].transform(
-        lambda x: x.fillna(x.median())
-    )
-    df[target_col] = df[target_col].fillna(overall_median)
+# ---------- FOREL ----------------------------------------------------------
+def forel(data: np.ndarray, radius: float):
+    n = data.shape[0]
+    labels = np.full(n, -1, int)
+    remaining = np.arange(n)
+    cid = 0
+    while remaining.size:
+        center = data[np.random.choice(remaining)]
+        while True:
+            d = np.linalg.norm(data[remaining] - center, axis=1)
+            inside = remaining[d <= radius]
+            new_center = data[inside].mean(axis=0)
+            if np.allclose(new_center, center):
+                break
+            center = new_center
+        labels[inside] = cid
+        remaining = remaining[d > radius]
+        cid += 1
+    return labels, [data[labels == k].mean(axis=0) for k in range(cid)]
 
 
-def impute_by_median(df, column):
-    median_val = df[column].median()
-    if pd.isna(median_val):
-        median_val = 0 
-    df[column] = df[column].fillna(median_val)
+# ---------- METRICS --------------------------------------------------------
+def cluster_compactness(X: np.ndarray, labels: np.ndarray):
+    return sum(((X[labels == k] - X[labels == k].mean(axis=0)) ** 2).sum()
+               for k in np.unique(labels) if k != -1)
 
 
-def impute_by_zet(df, column):
-    mean_val = df[column].mean()
-    std_val = df[column].std()
-
-    if pd.isna(std_val) or std_val == 0:
-        std_val = 1  # избежать деления на 0
-
-    z_scores = (df[column] - mean_val) / std_val
-    close_values = df[(~df[column].isnull()) & (np.abs(z_scores) < 1.5)][column]
-
-    median_close = close_values.median()
-    if pd.isna(median_close):
-        median_close = df[column].median()
-    if pd.isna(median_close):
-        median_close = 0  # запасной план
-
-    df[column] = df[column].fillna(median_close)
+def cluster_statistics(X: np.ndarray, labels: np.ndarray):
+    stats = []
+    for k in np.unique(labels):
+        if k == -1:
+            continue
+        pts = X[labels == k]
+        ctr = pts.mean(axis=0)
+        stats.append(dict(cluster=int(k),
+                          size=int(len(pts)),
+                          sse=float(((pts - ctr) ** 2).sum()),
+                          radius=float(np.linalg.norm(pts - ctr, axis=1).max())))
+    return stats
 
 
-def evaluate_recovery(original_df, restored_df, mask_indices, column):
-    errors = []
-    for i in mask_indices:
-        true_val = original_df.loc[i, column]
-        predicted_val = restored_df.loc[i, column]
-        if pd.notna(true_val) and pd.notna(predicted_val) and true_val != 0:
-            relative_error = abs(true_val - predicted_val) / abs(true_val)
-            errors.append(relative_error)
-    if errors:
-        delta = 100 * (sum(errors) / len(errors))
-    else:
-        delta = None
-    return delta
+# ---------- FEATURE SEARCH -------------------------------------------------
+def feature_search(df: pd.DataFrame, radius: float, k: int,
+                   max_iter: int = 100, seed: int = 0):
+    rng = np.random.default_rng(seed)
+    n = df.shape[1]
+    k = max(1, min(k, n))
+    w = np.ones(n)
+    best, best_score = list(range(k)), np.inf
+    for _ in range(max_iter):
+        p = w / w.sum()
+        sub = rng.choice(n, size=k, replace=False, p=p)
+        X = df.iloc[:, sub].to_numpy(float)
+        lbl, _ = forel(X, radius)
+        score = cluster_compactness(X, lbl)
+        if score < best_score:
+            best, best_score = sub, score
+            w[sub] *= 1.2
+        w *= 0.99
+    return sorted(best), best_score
 
-def get_distribution_parameters(df, column):
-    data = df[column].dropna()
-    if data.empty:
-        return {}
-    return {
-        "mean": data.mean(),
-        "median": data.median(),
-        "mode": data.mode().iloc[0] if not data.mode().empty else None,
-        "std": data.std(),
-        "var": data.var(),
-        "skew": data.skew(),
-        "kurtosis": data.kurtosis(),
-        "min": data.min(),
-        "max": data.max(),
-        "iqr": data.quantile(0.75) - data.quantile(0.25)
-    }
 
-def compare_distributions(dict1, dict2):
-    result = {}
-    for key in dict1:
-        val1 = dict1.get(key)
-        val2 = dict2.get(key)
-        if val1 is not None and val2 is not None:
-            result[key] = val2 - val1
-        else:
-            result[key] = None
-    return result
-
-class PandasModel(QAbstractTableModel):
-    def __init__(self, df=pd.DataFrame(), parent=None):
-        super().__init__(parent)
-        self._df = df
-
-    def rowCount(self, parent=None):
-        return len(self._df)
-
-    def columnCount(self, parent=None):
-        return len(self._df.columns)
-
-    def data(self, index, role=Qt.DisplayRole):
-        if not index.isValid() or role != Qt.DisplayRole:
-            return None
-        return str(self._df.iat[index.row(), index.column()])
-
-    def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if role != Qt.DisplayRole:
-            return None
-        if orientation == Qt.Horizontal:
-            return str(self._df.columns[section])
-        else:
-            return str(self._df.index[section])
-
-class MainWindow(QMainWindow):
+# ---------- GUI ------------------------------------------------------------
+class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("laba4")
-        self.df = pd.DataFrame()
-        self.column_checkboxes = {}
-        self.init_ui()
-        self.df_with_missing = pd.DataFrame()
-        self.miss_indices = {}
+        self.title("FOREL Clustering Lab v8 — кодирование категориальных")
+        self.geometry("1240x780")
 
-    def init_ui(self):
-        central = QWidget()
-        main_layout = QVBoxLayout(central)
-        self.setCentralWidget(central)
+        # данные
+        self.data: pd.DataFrame | None = None
+        self.selected: list[int] | None = None
+        self.labels = None
 
-        load_btn = QPushButton("Загрузить xml")
-        load_btn.clicked.connect(self.load_data)
-        main_layout.addWidget(load_btn)
+        # vars
+        self.encode_var = tk.BooleanVar(value=True)
+        self.n_rows = tk.IntVar(value=200)
+        self.radius = tk.DoubleVar(value=1.0)
+        self.k_var  = tk.IntVar(value=4)
 
-        self.table = QTableView()
-        main_layout.addWidget(self.table)
+        self._build_ui()
 
-        self.columns_box = QGroupBox("Столбцы для работы")
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self.columns_box)
-        self.columns_layout = QVBoxLayout(self.columns_box)
-        main_layout.addWidget(scroll)
+    # ---------- Build UI ----------------------------------------------------
+    def _build_ui(self):
+        main = ttk.PanedWindow(self, orient="horizontal")
+        main.pack(fill=tk.BOTH, expand=True)
 
-        form_layout = QFormLayout()
-        self.percent_sb = QSpinBox()
-        self.percent_sb.setRange(1, 100)
-        self.percent_sb.setValue(10)
-        form_layout.addRow("Процент затирания:", self.percent_sb)
+        # LEFT
+        left = ttk.Frame(main, width=350)
+        left.pack_propagate(False)
+        main.add(left)
 
-        self.group_cb = QCheckBox("Групповая медиана")
-        self.median_cb = QCheckBox("Глобальная медиана")
-        self.zscore_cb = QCheckBox("Zet-алгоритм")
+        ctrl = ttk.Frame(left)
+        ctrl.pack(fill=tk.X, padx=5, pady=5)
 
-        for cb in [self.group_cb, self.median_cb, self.zscore_cb]:
-            cb.setChecked(True)
-            form_layout.addRow(cb)
+        ttk.Button(ctrl, text="Загрузить CSV", command=self.load_csv).pack(fill=tk.X, pady=2)
 
-        self.group_selector = QComboBox()
-        form_layout.addRow("Столбец для группировки:", self.group_selector)
+        ttk.Label(ctrl, text="N строк (генерация)").pack(anchor=tk.W)
+        ttk.Entry(ctrl, textvariable=self.n_rows).pack(fill=tk.X, pady=1)
+        ttk.Button(ctrl, text="Сгенерировать датасет", command=self.generate_dataset).pack(fill=tk.X, pady=2)
 
-        erase_btn = QPushButton("Затереть")
-        erase_btn.clicked.connect(self.introduce_missing_data)
-        form_layout.addRow(erase_btn)
+        ttk.Button(ctrl, text="Сохранить CSV", command=self.save_csv).pack(fill=tk.X, pady=2)
 
-        impute_btn = QPushButton("Восстановить")
-        impute_btn.clicked.connect(self.run_imputation)
-        form_layout.addRow(impute_btn)
+        ttk.Checkbutton(ctrl, text="Кодировать категориальные",
+                        variable=self.encode_var).pack(anchor=tk.W, pady=(2, 0))
 
-        main_layout.addLayout(form_layout)
+        ttk.Separator(ctrl, orient="horizontal").pack(fill=tk.X, pady=4)
 
-        self.log = QTextEdit()
-        self.log.setReadOnly(True)
-        main_layout.addWidget(self.log)
+        ttk.Label(ctrl, text="Радиус R").pack(anchor=tk.W)
+        ttk.Entry(ctrl, textvariable=self.radius).pack(fill=tk.X, pady=1)
 
-    def load_data(self):
-        path, _ = QFileDialog.getOpenFileName(self, 'Open Excel File', '', 'Excel Files (*.xlsx *.xls)')
-        if not path:
+        ttk.Label(ctrl, text="Количество признаков K").pack(anchor=tk.W)
+        ttk.Entry(ctrl, textvariable=self.k_var).pack(fill=tk.X, pady=1)
+
+        ttk.Button(ctrl, text="Выбрать признаки", command=self.select_features).pack(fill=tk.X, pady=2)
+        ttk.Button(ctrl, text="Кластеризовать", command=self.cluster).pack(fill=tk.X, pady=2)
+        ttk.Button(ctrl, text="Оценить кластеры", command=self.evaluate_clusters).pack(fill=tk.X, pady=2)
+
+        ttk.Separator(ctrl, orient="horizontal").pack(fill=tk.X, pady=4)
+
+        tv_frame = ttk.Frame(left)
+        tv_frame.pack(fill=tk.BOTH, expand=True, padx=5)
+        self.tree = ttk.Treeview(tv_frame, show="headings")
+        ysb = ttk.Scrollbar(tv_frame, orient="vertical", command=self.tree.yview)
+        xsb = ttk.Scrollbar(tv_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscroll=ysb.set, xscroll=xsb.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ysb.pack(side=tk.RIGHT, fill=tk.Y)
+        xsb.pack(side=tk.BOTTOM, fill=tk.X)
+
+        ttk.Label(left, text="Лог").pack(anchor=tk.W, padx=5)
+        self.log = tk.Text(left, height=10, width=40)
+        self.log.pack(fill=tk.X, padx=5, pady=(0, 5))
+
+        # RIGHT – plot
+        right = ttk.Frame(main)
+        main.add(right, stretch="always")
+        self.fig, self.ax = plt.subplots(figsize=(7.5, 7.5))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=right)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    # ---------- Dataset view -----------------------------------------------
+    def update_dataset_view(self):
+        self.tree.delete(*self.tree.get_children())
+        if self.data is None:
+            return
+        idx = self.selected or list(range(self.data.shape[1]))
+        df = self.data.iloc[:, idx].copy()
+        if self.labels is not None:
+            df["cluster"] = self.labels
+        df = df.head(PREVIEW_ROWS)
+
+        self.tree["columns"] = list(df.columns)
+        for col in df.columns:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=100, anchor="center")
+        for _, row in df.iterrows():
+            self.tree.insert("", "end", values=row.to_numpy())
+
+    # ---------- Data operations --------------------------------------------
+    def _after_load(self, df: pd.DataFrame, msg: str):
+        self.data, self.labels = df, None
+        self.selected = list(range(df.shape[1]))
+        self._log(msg)
+        self._draw_plot()
+        self.update_dataset_view()
+
+    def generate_dataset(self):
+        n = self.n_rows.get()
+        rng = np.random.default_rng()
+        df = pd.DataFrame(rng.normal(size=(n, 16)),
+                          columns=[f"f{i+1}" for i in range(16)])
+        self._after_load(df, f"Сгенерирован датасет: {n}×16")
+
+    def load_csv(self):
+        fp = filedialog.askopenfilename(filetypes=[("CSV", "*.csv")])
+        if not fp:
             return
         try:
-            self.df = pd.read_excel(path)
-            self.table.setModel(PandasModel(self.df))
-            self.update_checkboxes()
-            self.update_group_selector()
+            raw = pd.read_csv(fp)
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load file:\n{e}")
-
-    def update_checkboxes(self):
-        for i in reversed(range(self.columns_layout.count())):
-            self.columns_layout.itemAt(i).widget().setParent(None)
-
-        self.column_checkboxes = {}
-        for col in self.df.columns:
-            cb = QCheckBox(col)
-            cb.setChecked(True)
-            self.columns_layout.addWidget(cb)
-            self.column_checkboxes[col] = cb
-
-    def update_group_selector(self):
-        self.group_selector.clear()
-        self.group_selector.addItems(self.df.columns.astype(str).tolist())
-
-    def introduce_missing_data(self):
-        if self.df.empty:
-            QMessageBox.warning(self, "Warning", "Сначала загрузите файл.")
+            messagebox.showerror("Ошибка чтения", str(e))
             return
 
-        selected_cols = [col for col, cb in self.column_checkboxes.items() if cb.isChecked()]
-        percent = self.percent_sb.value()
+        num = raw.select_dtypes(include=[np.number])
+        cat = raw.select_dtypes(exclude=[np.number])
 
-        self.df_with_missing = self.df.copy()
-        self.miss_indices = {}
-        for col in selected_cols:
-            self.df_with_missing, indices = introduce_missing_values(self.df_with_missing, col, percent)
-            self.miss_indices[col] = indices
+        if self.encode_var.get() and not cat.empty:
+            dummies = pd.get_dummies(cat, drop_first=True, dtype=float)
+            df = pd.concat([num, dummies], axis=1)
+            self._after_load(df,
+                             f"Загружено: {fp}  "
+                             f"(числовых: {num.shape[1]}, dummy: {dummies.shape[1]})")
+        else:
+            if not cat.empty:
+                messagebox.showinfo("Предупреждение",
+                                    "Категориальные столбцы отброшены "
+                                    "(снимите галочку, чтобы сохранять только числовые).")
+            if num.empty:
+                messagebox.showerror("Ошибка", "Не осталось числовых признаков.")
+                return
+            self._after_load(num, f"Загружено: {fp} (только числовые: {num.shape[1]})")
 
-        self.table.setModel(PandasModel(self.df_with_missing))
-        self.log.append(f"Затёрто {percent}% значений в колонках: {', '.join(selected_cols)}")
-
-
-    def run_imputation(self):
-        if self.df_with_missing.empty or not self.miss_indices:
-            QMessageBox.warning(self, "Warning", "Сначала выполните затирание.")
+    def save_csv(self):
+        if self.data is None:
+            messagebox.showinfo("Информация", "Нет данных для сохранения.")
             return
+        fp = filedialog.asksaveasfilename(defaultextension=".csv",
+                                          filetypes=[("CSV", "*.csv")])
+        if not fp:
+            return
+        df = self.data.copy()
+        if self.labels is not None:
+            df["cluster"] = self.labels
+        try:
+            df.to_csv(fp, index=False)
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e))
+            return
+        self._log(f"Сохранено: {fp}")
 
-        selected_cols = [col for col, cb in self.column_checkboxes.items() if cb.isChecked()]
-        group_col = self.group_selector.currentText()
-        methods = []
-        if self.group_cb.isChecked():
-            methods.append("group")
-        if self.median_cb.isChecked():
-            methods.append("median")
-        if self.zscore_cb.isChecked():
-            methods.append("zscore")
+    # ---------- Feature selection & clustering -----------------------------
+    def select_features(self):
+        if self.data is None:
+            messagebox.showinfo("Инфо", "Сначала загрузите или создайте датасет.")
+            return
+        k = min(self.k_var.get(), self.data.shape[1]); self.k_var.set(k)
+        sub, score = feature_search(self.data, self.radius.get(), k, max_iter=60)
+        self.selected, self.labels = sub, None
+        names = [self.data.columns[i] for i in sub]
+        self._log(f"Выбрано K={k}: {names} | SSE={score:.2f}")
+        self._draw_plot(); self.update_dataset_view()
 
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_entries = [f"--- Восстановление начато {timestamp} ---"]
+    def cluster(self):
+        if self.data is None or self.selected is None:
+            messagebox.showinfo("Инфо", "Сначала выберите признаки.")
+            return
+        X = self.data.iloc[:, self.selected].to_numpy()
+        self.labels, _ = forel(X, self.radius.get())
+        self._log(f"Кластеров: {len(np.unique(self.labels))} | "
+                  f"Общая SSE={cluster_compactness(X, self.labels):.2f}")
+        self._draw_plot(); self.update_dataset_view()
 
-        for col in selected_cols:
-            if col not in self.miss_indices:
-                continue
-            for method in methods:
-                df_copy = self.df_with_missing.copy()
-                try:
-                    if method == "group":
-                        if not group_col or group_col == col:
-                            raise ValueError("Неверный столбец для группировки.")
-                        impute_by_group(df_copy, col, group_col)
-                    elif method == "median":
-                        impute_by_median(df_copy, col)
-                    elif method == "zscore":
-                        impute_by_zet(df_copy, col)
-                    recovery = evaluate_recovery(self.df, df_copy, self.miss_indices[col], col)
-                    diff = compare_distributions(get_distribution_parameters(self.df, col), get_distribution_parameters(df_copy, col))
-                    if recovery is not None:
-                        log_entries.append(f"{method} | {col} | ошибка восстановления: {recovery:.2f}%\nDist diff: {diff}")
-                    else:
-                        log_entries.append(f"{method} | {col} | ошибка восстановления: N/A\nDist diff: {diff}")
-                    self.table.setModel(PandasModel(df_copy))
-                except Exception as e:
-                    log_entries.append(f"Ошибка в методе {method} для колонки {col}: {e}")
+    def evaluate_clusters(self):
+        if self.labels is None:
+            messagebox.showinfo("Инфо", "Сначала кластеризуйте.")
+            return
+        X = self.data.iloc[:, self.selected].to_numpy()
+        for s in cluster_statistics(X, self.labels):
+            self._log(f"id={s['cluster']} size={s['size']} "
+                      f"sse={s['sse']:.2f} Rmax={s['radius']:.2f}")
 
-        log_entries.append("--- Восстановление завершено ---")
-        log_text = "\n".join(log_entries)
-        self.log.append(log_text)
-        with open("imputation_log.txt", "a", encoding="utf-8") as f:
-            f.write(log_text + "\n\n")
+    # ---------- Plotting ----------------------------------------------------
+    def _draw_plot(self):
+        self.ax.clear()
+        if self.data is None:
+            self.ax.set_title("Нет данных"); self.canvas.draw(); return
 
-        selected_cols = [col for col, cb in self.column_checkboxes.items() if cb.isChecked()]
-        percent = self.percent_sb.value()
-        group_col = self.group_selector.currentText()
-        methods = []
-        if self.group_cb.isChecked():
-            methods.append("group")
-        if self.median_cb.isChecked():
-            methods.append("median")
-        if self.zscore_cb.isChecked():
-            methods.append("zscore")
+        cols = self.selected or list(range(self.data.shape[1]))
+        X = self.data.iloc[:, cols].to_numpy()
+        if X.shape[1] > 2:
+            X2 = PCA(n_components=2).fit_transform(X); xl, yl = "PC1", "PC2"
+        else:
+            X2 = X[:, :2]; xl = self.data.columns[cols[0]]
+            yl = self.data.columns[cols[1]] if len(cols) > 1 else ""
 
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_entries = [f"--- Run started at {timestamp} ---"]
+        if self.labels is not None:
+            for k in np.unique(self.labels):
+                idx = self.labels == k
+                self.ax.scatter(X2[idx, 0], X2[idx, 1], label=f"C{k}", s=40, alpha=0.8)
+            self.ax.legend(); title = "Кластеры (FOREL)"
+        else:
+            self.ax.scatter(X2[:, 0], X2[:, 1], color="gray", alpha=0.6, s=30)
+            title = "Данные / признаки"
 
-        for col in selected_cols:
-            df_miss, miss_indices = introduce_missing_values(self.df, col, percent)
-            log_entries.append(f"Introduced {percent}% missing in column '{col}'")
-            for method in methods:
-                df_copy = df_miss.copy()
-                try:
-                    if method == "group":
-                        if not group_col or group_col == col:
-                            raise ValueError("Invalid group column selected.")
-                        impute_by_group(df_copy, col, group_col)
-                    elif method == "median":
-                        impute_by_median(df_copy, col)
-                    elif method == "zscore":
-                        impute_by_zet(df_copy, col)
-                    recovery = evaluate_recovery(self.df, df_copy, miss_indices, col)
-                    diff = compare_distributions(get_distribution_parameters(self.df, col), get_distribution_parameters(df_copy, col))
-                    if recovery is not None:
-                        log_entries.append(f"{percent}% missing | {method} | {col} | recovery error: {recovery:.2f}%\nDistribution diff: {diff}\n")
-                    else:
-                        log_entries.append(f"{percent}% missing | {method} | {col} | recovery error: N/A\nDistribution diff: {diff}\n")
-                    self.table.setModel(PandasModel(df_copy))
-                except Exception as e:
-                    log_entries.append(f"Error with method {method} on column {col}: {e}")
+        self.ax.set_title(title); self.ax.set_xlabel(xl); self.ax.set_ylabel(yl)
+        self.fig.tight_layout(); self.canvas.draw()
 
-        log_entries.append("--- Run complete ---")
-        log_text = "\n".join(log_entries)
-        self.log.append(log_text)
-        with open("imputation_log.txt", "a", encoding="utf-8") as f:
-            f.write(log_text + "\n\n")
+    # ---------- Logging -----------------------------------------------------
+    def _log(self, txt: str):
+        self.log.insert(tk.END, txt + "\n"); self.log.see(tk.END)
 
-if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    mw = MainWindow()
-    mw.show()
-    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    App().mainloop()
